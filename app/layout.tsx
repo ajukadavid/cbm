@@ -1,10 +1,9 @@
 "use client";
 
 import { useEffect } from "react";
-import { ClerkProvider, useAuth, useUser } from "@clerk/nextjs";
+import { ClerkProvider, useAuth } from "@clerk/nextjs";
 import { ConvexProviderWithClerk } from "convex/react-clerk";
-import { ConvexReactClient } from "convex/react";
-import { useMutation } from "convex/react";
+import { ConvexReactClient, useConvexAuth, useMutation } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import { Toaster } from "sonner";
 import "./globals.css";
@@ -12,14 +11,13 @@ import "./globals.css";
 const convex = new ConvexReactClient(process.env.NEXT_PUBLIC_CONVEX_URL!);
 
 function UserSync({ children }: { children: React.ReactNode }) {
-  const { isSignedIn } = useAuth();
+  const { isLoading, isAuthenticated } = useConvexAuth();
   const store = useMutation(api.users.store);
 
   useEffect(() => {
-    if (isSignedIn) {
-      store().catch(console.error);
-    }
-  }, [isSignedIn, store]);
+    if (isLoading || !isAuthenticated) return;
+    store().catch(console.error);
+  }, [isLoading, isAuthenticated, store]);
 
   return <>{children}</>;
 }
@@ -31,7 +29,7 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body>
+      <body suppressHydrationWarning>
         <ClerkProvider>
           <ConvexProviderWithClerk client={convex} useAuth={useAuth}>
             <UserSync>{children}</UserSync>

@@ -11,6 +11,76 @@ function eventVisibleToUser(
   return event.ownerId === userId || event.participantIds.includes(userId);
 }
 
+function timestampToDateStr(ts: number): string {
+  const d = new Date(ts);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+export const listMyCalendarFeed = query({
+  args: {
+    date: v.optional(v.string()),
+  },
+  handler: async (ctx, { date }) => {
+    const user = await getCurrentUserOrThrow(ctx);
+
+    const allEvents = await ctx.db.query("calendar_events").collect();
+    const events = allEvents
+      .filter((e) => eventVisibleToUser(e, user._id))
+      .map((e) => ({
+        kind: "event" as const,
+        id: e._id,
+        title: e.title,
+        date: e.date,
+        endDate: e.endDate ?? e.date,
+        startTime: e.startTime,
+        endTime: e.endTime,
+        description: e.description,
+      }));
+
+    const assignments = await ctx.db
+      .query("task_assignments")
+      .withIndex("byUserId", (q) => q.eq("userId", user._id))
+      .collect();
+
+    const tasks = await Promise.all(
+      assignments.map((a) => ctx.db.get(a.taskId))
+    );
+
+    const taskItems = tasks
+      .filter((t) => t && t.dueDate && t.status !== "done")
+      .map((t) => ({
+        kind: "task" as const,
+        id: `task-${t!._id}`,
+        taskId: t!._id,
+        title: t!.title,
+        date: timestampToDateStr(t!.dueDate!),
+        endDate: timestampToDateStr(t!.dueDate!),
+        taskStatus: t!.status,
+        description: t!.description,
+      }));
+
+    let combined = [...events, ...taskItems];
+
+    if (date) {
+      combined = combined.filter((item) => {
+        const end = item.endDate ?? item.date;
+        return date >= item.date && date <= end;
+      });
+    }
+
+    return combined.sort((a, b) => {
+      const d = a.date.localeCompare(b.date);
+      if (d !== 0) return d;
+      const aTime = "startTime" in a && a.startTime ? a.startTime : "99:99";
+      const bTime = "startTime" in b && b.startTime ? b.startTime : "99:99";
+      return aTime.localeCompare(bTime);
+    });
+  },
+});
+
 export const listMyEvents = query({
   args: {
     date: v.optional(v.string()),

@@ -2,12 +2,14 @@
 // @ts-nocheck
 
 import { useMemo, useState } from "react";
+import Link from "next/link";
 import { useMutation, useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import { Id } from "@/convex/_generated/dataModel";
 import { format, addDays, startOfMonth, endOfMonth, eachDayOfInterval, isSameDay } from "date-fns";
 import { toast } from "sonner";
 import { formatUserName } from "@/lib/utils";
+import { theme } from "@/lib/theme";
 import { ChevronLeft, ChevronRight, Plus, Trash2 } from "lucide-react";
 
 export default function CalendarPage() {
@@ -17,6 +19,7 @@ export default function CalendarPage() {
   const [editingId, setEditingId] = useState<Id<"calendar_events"> | null>(null);
 
   const events = useQuery(api.calendar.listMyEvents, {});
+  const calendarFeed = useQuery(api.calendar.listMyCalendarFeed, {});
   const users = useQuery(api.users.listUsers);
   const deleteEvent = useMutation(api.calendar.deleteEvent);
 
@@ -25,27 +28,30 @@ export default function CalendarPage() {
   const days = eachDayOfInterval({ start: monthStart, end: monthEnd });
 
   const selectedDateStr = format(selectedDate, "yyyy-MM-dd");
-  const dayEvents = useMemo(
+  const dayItems = useMemo(
     () =>
-      (events ?? []).filter((e) => {
-        const end = e.endDate ?? e.date;
-        return selectedDateStr >= e.date && selectedDateStr <= end;
+      (calendarFeed ?? []).filter((item) => {
+        const end = item.endDate ?? item.date;
+        return selectedDateStr >= item.date && selectedDateStr <= end;
       }),
-    [events, selectedDateStr]
+    [calendarFeed, selectedDateStr]
   );
 
-  const eventsByDay = useMemo(() => {
-    const map = new Map<string, number>();
-    for (const e of events ?? []) {
-      const start = new Date(e.date);
-      const end = new Date(e.endDate ?? e.date);
+  const itemsByDay = useMemo(() => {
+    const map = new Map<string, { events: number; tasks: number }>();
+    for (const item of calendarFeed ?? []) {
+      const start = new Date(item.date + "T12:00:00");
+      const end = new Date((item.endDate ?? item.date) + "T12:00:00");
       for (let d = start; d <= end; d = addDays(d, 1)) {
         const key = format(d, "yyyy-MM-dd");
-        map.set(key, (map.get(key) ?? 0) + 1);
+        const entry = map.get(key) ?? { events: 0, tasks: 0 };
+        if (item.kind === "task") entry.tasks += 1;
+        else entry.events += 1;
+        map.set(key, entry);
       }
     }
     return map;
-  }, [events]);
+  }, [calendarFeed]);
 
   return (
     <div className="space-y-6">
@@ -53,7 +59,7 @@ export default function CalendarPage() {
         <div>
           <h1 className="text-2xl font-bold">My Calendar</h1>
           <p className="text-slate-600 text-sm mt-1">
-            Your events plus meetings you&apos;re invited to.
+            Your events, meetings, and task deadlines assigned to you.
           </p>
         </div>
         <button
@@ -61,7 +67,7 @@ export default function CalendarPage() {
             setEditingId(null);
             setShowForm(true);
           }}
-          className="flex items-center gap-2 px-4 py-2 bg-slate-900 text-white rounded-lg text-sm"
+          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm ${theme.btnPrimary}`}
         >
           <Plus className="w-4 h-4" />
           Add event
@@ -96,21 +102,38 @@ export default function CalendarPage() {
             ))}
             {days.map((day) => {
               const key = format(day, "yyyy-MM-dd");
-              const count = eventsByDay.get(key) ?? 0;
+              const counts = itemsByDay.get(key);
+              const hasDeadline = (counts?.tasks ?? 0) > 0;
+              const hasEvent = (counts?.events ?? 0) > 0;
               const selected = isSameDay(day, selectedDate);
+              const isToday = isSameDay(day, new Date());
+
+              let cellClass =
+                "aspect-square rounded-lg text-sm flex flex-col items-center justify-center transition-colors ";
+              if (selected) {
+                cellClass += hasDeadline
+                  ? "bg-red-600 text-white font-semibold"
+                  : "bg-green-700 text-white font-semibold";
+              } else if (hasDeadline) {
+                cellClass +=
+                  "bg-red-100 text-red-800 font-semibold ring-1 ring-red-300 hover:bg-red-200";
+              } else if (isToday) {
+                cellClass += "ring-2 ring-green-500 hover:bg-green-50";
+              } else {
+                cellClass += "hover:bg-green-50 text-green-900";
+              }
+
               return (
                 <button
                   key={key}
                   onClick={() => setSelectedDate(day)}
-                  className={`aspect-square rounded-lg text-sm flex flex-col items-center justify-center ${
-                    selected ? "bg-slate-900 text-white" : "hover:bg-slate-100"
-                  }`}
+                  className={cellClass}
                 >
                   {format(day, "d")}
-                  {count > 0 && (
+                  {hasEvent && !hasDeadline && (
                     <span
                       className={`w-1.5 h-1.5 rounded-full mt-0.5 ${
-                        selected ? "bg-white" : "bg-blue-500"
+                        selected ? "bg-green-200" : "bg-green-600"
                       }`}
                     />
                   )}
@@ -124,50 +147,84 @@ export default function CalendarPage() {
           <h2 className="font-semibold mb-4">
             {format(selectedDate, "EEEE, MMMM d, yyyy")}
           </h2>
-          {dayEvents.length === 0 ? (
-            <p className="text-sm text-slate-500">No events this day.</p>
+          {dayItems.length === 0 ? (
+            <p className="text-sm text-slate-500">Nothing scheduled this day.</p>
           ) : (
             <ul className="space-y-3">
-              {dayEvents.map((e) => (
-                <li key={e._id} className="border rounded-lg p-3">
-                  <div className="flex justify-between gap-2">
-                    <div>
-                      <p className="font-medium">{e.title}</p>
-                      <p className="text-sm text-slate-500">
-                        {e.startTime} – {e.endTime}
-                      </p>
-                      {e.description && (
-                        <p className="text-sm text-slate-600 mt-1">{e.description}</p>
-                      )}
+              {dayItems.map((item) =>
+                item.kind === "event" ? (
+                  <li key={item.id} className="border rounded-lg p-3">
+                    <div className="flex justify-between gap-2">
+                      <div>
+                        <p className="font-medium">{item.title}</p>
+                        <p className="text-sm text-slate-500">
+                          {item.startTime} – {item.endTime}
+                        </p>
+                        {item.description && (
+                          <p className="text-sm text-slate-600 mt-1">
+                            {item.description}
+                          </p>
+                        )}
+                      </div>
+                      <div className="flex gap-1 shrink-0">
+                        <button
+                          onClick={() => {
+                            setEditingId(item.id);
+                            setShowForm(true);
+                          }}
+                          className="text-xs px-2 py-1 border rounded hover:bg-slate-50"
+                        >
+                          Edit
+                        </button>
+                        <button
+                          onClick={async () => {
+                            if (!confirm("Delete event?")) return;
+                            try {
+                              await deleteEvent({ eventId: item.id });
+                              toast.success("Deleted");
+                            } catch (err: any) {
+                              toast.error(err.message);
+                            }
+                          }}
+                          className="p-1 text-red-500 hover:bg-red-50 rounded"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
                     </div>
-                    <div className="flex gap-1 shrink-0">
-                      <button
-                        onClick={() => {
-                          setEditingId(e._id);
-                          setShowForm(true);
-                        }}
-                        className="text-xs px-2 py-1 border rounded hover:bg-slate-50"
+                  </li>
+                ) : (
+                  <li
+                    key={item.id}
+                    className="border border-red-200 bg-red-50/50 rounded-lg p-3"
+                  >
+                    <div className="flex justify-between gap-2 items-start">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <p className="font-medium">{item.title}</p>
+                          <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-red-200 text-red-800 font-medium">
+                            Task due
+                          </span>
+                        </div>
+                        <p className="text-sm text-slate-500 mt-0.5">
+                          Deadline · {item.taskStatus?.replace("_", " ")}
+                        </p>
+                        {item.description && (
+                          <p className="text-sm text-slate-600 mt-1">
+                            {item.description}
+                          </p>
+                        )}
+                      </div>
+                      <Link
+                        href="/tasks"
+                        className="text-xs px-2 py-1 border border-red-200 rounded hover:bg-white shrink-0"
                       >
-                        Edit
-                      </button>
-                      <button
-                        onClick={async () => {
-                          if (!confirm("Delete event?")) return;
-                          try {
-                            await deleteEvent({ eventId: e._id });
-                            toast.success("Deleted");
-                          } catch (err: any) {
-                            toast.error(err.message);
-                          }
-                        }}
-                        className="p-1 text-red-500 hover:bg-red-50 rounded"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
+                        Open tasks
+                      </Link>
                     </div>
-                  </div>
-                </li>
-              ))}
+                  </li>
+                )
+              )}
             </ul>
           )}
         </div>
@@ -295,21 +352,7 @@ function EventFormDialog({
             onChange={(e) => setDescription(e.target.value)}
             className="w-full border rounded-lg px-3 py-2 text-sm min-h-[60px]"
           />
-          <div>
-            <p className="text-sm font-medium mb-2">Invite participants</p>
-            <div className="max-h-32 overflow-y-auto border rounded-lg p-2 space-y-1">
-              {users.map((u) => (
-                <label key={u._id} className="flex items-center gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={participants.has(u._id)}
-                    onChange={() => toggleParticipant(u._id)}
-                  />
-                  {formatUserName(u)}
-                </label>
-              ))}
-            </div>
-          </div>
+    
         </div>
         <div className="flex gap-2 justify-end mt-6">
           <button onClick={onClose} className="px-4 py-2 text-sm border rounded-lg">
@@ -318,7 +361,7 @@ function EventFormDialog({
           <button
             onClick={handleSave}
             disabled={saving}
-            className="px-4 py-2 text-sm bg-slate-900 text-white rounded-lg disabled:opacity-50"
+            className={`px-4 py-2 text-sm rounded-lg disabled:opacity-50 ${theme.btnPrimary}`}
           >
             {saving ? "Saving…" : "Save"}
           </button>

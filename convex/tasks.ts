@@ -1,8 +1,13 @@
 // @ts-nocheck
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
-import { getCurrentUserOrThrow, displayName } from "./users";
+import {
+  getCurrentUserOrThrow,
+  requireAdminTier,
+  displayName,
+} from "./users";
 import { resolveInboxDocument } from "./files";
+import { isAdminTier } from "../lib/roles";
 import { Id } from "./_generated/dataModel";
 
 const statusValidator = v.union(
@@ -30,6 +35,67 @@ async function isTaskParticipant(
 ) {
   const assignees = await getTaskAssigneeIds(ctx, taskId);
   return assignees.includes(userId);
+}
+
+async function canAccessTask(
+  ctx: { db: any },
+  task: { _id: Id<"tasks">; createdBy: Id<"users"> },
+  user: { _id: Id<"users">; role: string }
+) {
+  if (task.createdBy === user._id) return true;
+  if (await isTaskParticipant(ctx, task._id, user._id)) return true;
+  if (isAdminTier(user.role as any)) return true;
+  return false;
+}
+
+async function requireTaskAccess(
+  ctx: { db: any },
+  taskId: Id<"tasks">,
+  user: { _id: Id<"users">; role: string }
+) {
+  const task = await ctx.db.get(taskId);
+  if (!task) throw new Error("Task not found");
+  if (!(await canAccessTask(ctx, task, user))) {
+    throw new Error("Not authorized");
+  }
+  return task;
+}
+
+async function insertTaskMessage(
+  ctx: { db: any },
+  {
+    taskId,
+    authorId,
+    authorName,
+    body,
+    storageId,
+    fileName,
+    fileSize,
+  }: {
+    taskId: Id<"tasks">;
+    authorId: Id<"users">;
+    authorName: string;
+    body?: string;
+    storageId?: Id<"_storage">;
+    fileName?: string;
+    fileSize?: number;
+  }
+) {
+  const text = body?.trim();
+  if (!text && !storageId) {
+    throw new Error("Add a message or attach a file");
+  }
+
+  await ctx.db.insert("task_messages", {
+    taskId,
+    body: text || undefined,
+    storageId,
+    fileName,
+    fileSize,
+    authorId,
+    authorName,
+    createdAt: Date.now(),
+  });
 }
 
 async function enrichTask(ctx: { db: any }, task: any) {
@@ -70,7 +136,7 @@ export const listMyTasks = query({
 export const listAllTasks = query({
   args: {},
   handler: async (ctx) => {
-    await getCurrentUserOrThrow(ctx);
+    await requireAdminTier(ctx);
     const tasks = await ctx.db.query("tasks").order("desc").collect();
     return Promise.all(tasks.map((t) => enrichTask(ctx, t)));
   },
@@ -99,7 +165,7 @@ export const createTask = mutation({
     assignmentDocumentName: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    const user = await getCurrentUserOrThrow(ctx);
+    const user = await requireAdminTier(ctx);
 
     if (args.assigneeIds.length === 0) {
       throw new Error("Select at least one assignee");
@@ -151,6 +217,17 @@ export const createTask = mutation({
       });
     }
 
+    if (args.description?.trim() || docs.assignmentDocumentId) {
+      await insertTaskMessage(ctx, {
+        taskId,
+        authorId: user._id,
+        authorName: displayName(user),
+        body: args.description?.trim(),
+        storageId: docs.assignmentDocumentId,
+        fileName: docs.assignmentDocumentName,
+      });
+    }
+
     return taskId;
   },
 });
@@ -168,11 +245,72 @@ export const updateTaskStatus = mutation({
     const isAssignee = await isTaskParticipant(ctx, taskId, user._id);
     const isCreator = task.createdBy === user._id;
 
-    if (!isAssignee && !isCreator && user.role !== "admin") {
+    if (!isAssignee && !isCreator && !isAdminTier(user.role)) {
       throw new Error("Not authorized");
     }
 
+    if (status === "done" && !isCreator) {
+      throw new Error("Only the person who assigned this task can mark it complete");
+    }
+
     await ctx.db.patch(taskId, { status, updatedAt: Date.now() });
+  },
+});
+
+export const listTaskMessages = query({
+  args: { taskId: v.id("tasks") },
+  handler: async (ctx, { taskId }) => {
+    const user = await getCurrentUserOrThrow(ctx);
+    await requireTaskAccess(ctx, taskId, user);
+
+    const messages = await ctx.db
+      .query("task_messages")
+      .withIndex("byTaskId", (q) => q.eq("taskId", taskId))
+      .collect();
+
+    return messages.sort((a, b) => a.createdAt - b.createdAt);
+  },
+});
+
+export const addTaskMessage = mutation({
+  args: {
+    taskId: v.id("tasks"),
+    body: v.optional(v.string()),
+    storageId: v.optional(v.id("_storage")),
+    fileName: v.optional(v.string()),
+    fileSize: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const user = await getCurrentUserOrThrow(ctx);
+    const task = await requireTaskAccess(ctx, args.taskId, user);
+
+    if (task.status === "done") {
+      throw new Error("This task is complete — reopen it to add messages");
+    }
+
+    await insertTaskMessage(ctx, {
+      taskId: args.taskId,
+      authorId: user._id,
+      authorName: displayName(user),
+      body: args.body,
+      storageId: args.storageId,
+      fileName: args.fileName,
+      fileSize: args.fileSize,
+    });
+
+    await ctx.db.patch(args.taskId, { updatedAt: Date.now() });
+  },
+});
+
+export const getMessageFileUrl = mutation({
+  args: { messageId: v.id("task_messages") },
+  handler: async (ctx, { messageId }) => {
+    const user = await getCurrentUserOrThrow(ctx);
+    const message = await ctx.db.get(messageId);
+    if (!message?.storageId) return null;
+
+    await requireTaskAccess(ctx, message.taskId, user);
+    return await ctx.storage.getUrl(message.storageId);
   },
 });
 
@@ -186,7 +324,7 @@ export const updateTaskAssignees = mutation({
     const task = await ctx.db.get(taskId);
     if (!task) throw new Error("Task not found");
 
-    if (task.createdBy !== user._id && user.role !== "admin") {
+    if (task.createdBy !== user._id && !isAdminTier(user.role)) {
       throw new Error("Only the task creator or admin can change assignees");
     }
 
@@ -224,7 +362,7 @@ export const deleteTask = mutation({
     const task = await ctx.db.get(taskId);
     if (!task) throw new Error("Task not found");
 
-    if (task.createdBy !== user._id && user.role !== "admin") {
+    if (task.createdBy !== user._id && !isAdminTier(user.role)) {
       throw new Error("Not authorized");
     }
 
@@ -234,6 +372,14 @@ export const deleteTask = mutation({
       .collect();
 
     for (const row of assignments) {
+      await ctx.db.delete(row._id);
+    }
+
+    const messages = await ctx.db
+      .query("task_messages")
+      .withIndex("byTaskId", (q) => q.eq("taskId", taskId))
+      .collect();
+    for (const row of messages) {
       await ctx.db.delete(row._id);
     }
 
